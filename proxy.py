@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 CLASSIFICATION_SERVER_URL = "http://localhost:8001/classify"
 
 app = FastAPI(
-    title="Simple Intelligent Classification Proxy",
-    description="Simple proxy with intelligent batching to minimize total processing time"
+    title="Smart Batching Classification Proxy",
+    description="Smart proxy with intelligent batching for sub-4 second performance"
 )
 
 class ProxyRequest(BaseModel):
@@ -27,41 +27,38 @@ class ProxyResponse(BaseModel):
     """Response model containing classification result ('code' or 'not code')"""
     result: str
 
-class SimpleBatchingProxy:
+class SmartBatchingProxy:
     def __init__(self):
         self.http_client = None
         self.pending_requests = {}  # request_id -> (sequence, future)
         self.batch_size = 5
-        self.batch_timeout = 0.005  # 5ms to collect batch
+        self.batch_timeout = 0.0001  # 0.1ms to collect batch - extremely aggressive
         self.server_semaphore = asyncio.Semaphore(1)
+        self.processing_task = None
         
     async def initialize(self):
-        """Initialize HTTP client"""
+        """Initialize HTTP client and start background processing"""
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=1.0),
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=100),
             http2=True
         )
-        logger.info("SimpleBatchingProxy initialized")
+        
+        # Start background processing task
+        self.processing_task = asyncio.create_task(self._background_processor())
+        logger.info("SmartBatchingProxy initialized")
     
     async def classify(self, sequence: str) -> str:
-        """Classify a single sequence with intelligent batching"""
+        """Classify a single sequence with smart batching"""
         request_id = str(uuid.uuid4())
         
         # Create a future for this request
         future = asyncio.Future()
         self.pending_requests[request_id] = (sequence, future)
         
-        # Try to process immediately if we have enough requests
-        if len(self.pending_requests) >= self.batch_size:
-            await self._process_batch()
-        else:
-            # Schedule batch processing after timeout
-            asyncio.create_task(self._process_batch_with_timeout())
-        
-        # Wait for result
+        # Wait for result with very short timeout
         try:
-            result = await asyncio.wait_for(future, timeout=5.0)
+            result = await asyncio.wait_for(future, timeout=2.0)
             return result
         except asyncio.TimeoutError:
             logger.warning(f"Request {request_id} timed out")
@@ -71,11 +68,24 @@ class SimpleBatchingProxy:
             if request_id in self.pending_requests:
                 del self.pending_requests[request_id]
     
-    async def _process_batch_with_timeout(self):
-        """Process batch after timeout if we have requests"""
-        await asyncio.sleep(self.batch_timeout)
-        if self.pending_requests:
-            await self._process_batch()
+    async def _background_processor(self):
+        """Background task that continuously processes batches"""
+        while True:
+            try:
+                if len(self.pending_requests) >= self.batch_size:
+                    # Process immediately if we have a full batch
+                    await self._process_batch()
+                elif len(self.pending_requests) > 0:
+                    # Wait extremely briefly for more requests
+                    await asyncio.sleep(self.batch_timeout)
+                    if len(self.pending_requests) > 0:
+                        await self._process_batch()
+                else:
+                    # No requests, sleep very briefly
+                    await asyncio.sleep(0.0001)
+            except Exception as e:
+                logger.error(f"Background processor error: {e}")
+                await asyncio.sleep(0.001)
     
     async def _process_batch(self):
         """Process current batch of requests"""
@@ -120,7 +130,7 @@ class SimpleBatchingProxy:
                                         future.set_result(result)
                                     break
                     
-                    logger.info(f"✅ Processed batch of {len(sequences)} requests")
+                    logger.info(f"🚀 Smart batch of {len(sequences)} requests processed")
                     
                 elif response.status_code == 429:
                     # Rate limited - process requests individually
@@ -162,11 +172,13 @@ class SimpleBatchingProxy:
     
     async def shutdown(self):
         """Shutdown the proxy"""
+        if self.processing_task:
+            self.processing_task.cancel()
         if self.http_client:
             await self.http_client.aclose()
 
 # Global proxy instance
-proxy = SimpleBatchingProxy()
+proxy = SmartBatchingProxy()
 
 @app.on_event("startup")
 async def startup_event():
