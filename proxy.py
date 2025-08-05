@@ -7,7 +7,6 @@ import asyncio
 import json
 from typing import List, Dict, Optional
 import logging
-from collections import deque
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +32,7 @@ class SimpleBatchingProxy:
         self.http_client = None
         self.pending_requests = {}  # request_id -> (sequence, future)
         self.batch_size = 5
-        self.batch_timeout = 0.01  # 10ms to collect batch
+        self.batch_timeout = 0.005  # 5ms to collect batch
         self.server_semaphore = asyncio.Semaphore(1)
         
     async def initialize(self):
@@ -62,7 +61,7 @@ class SimpleBatchingProxy:
         
         # Wait for result
         try:
-            result = await asyncio.wait_for(future, timeout=10.0)
+            result = await asyncio.wait_for(future, timeout=5.0)
             return result
         except asyncio.TimeoutError:
             logger.warning(f"Request {request_id} timed out")
@@ -107,14 +106,15 @@ class SimpleBatchingProxy:
                     
                     # Set results for all requests in batch
                     for request_id, result in zip(request_ids, results):
-                        if request_id in self.pending_requests:
-                            # Request was added back, set the result
-                            _, future = self.pending_requests[request_id]
-                            if not future.done():
-                                future.set_result(result)
+                        # Find the original future and set result
+                        for req_id, (seq, future) in list(self.pending_requests.items()):
+                            if seq == sequences[request_ids.index(request_id)]:
+                                if not future.done():
+                                    future.set_result(result)
+                                break
                         else:
-                            # Find the original future and set result
-                            for req_id, (seq, future) in self.pending_requests.items():
+                            # If not found in pending, it might be in the batch_items
+                            for req_id, (seq, future) in batch_items:
                                 if seq == sequences[request_ids.index(request_id)]:
                                     if not future.done():
                                         future.set_result(result)
@@ -130,14 +130,14 @@ class SimpleBatchingProxy:
                             individual_result = await self._process_single(sequence)
                             future.set_result(individual_result)
                 else:
-                    # Error - set timeout for all requests
+                    # Error - set error for all requests
                     for request_id, (sequence, future) in batch_items:
                         if not future.done():
                             future.set_result("error")
                             
             except Exception as e:
                 logger.error(f"Batch processing error: {e}")
-                # Set timeout for all requests
+                # Set error for all requests
                 for request_id, (sequence, future) in batch_items:
                     if not future.done():
                         future.set_result("error")
